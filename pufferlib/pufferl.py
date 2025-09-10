@@ -28,7 +28,10 @@ from torch.distributed.elastic.multiprocessing.errors import record
 import torch.utils.cpp_extension
 
 import pufferlib
-import pufferlib.sweep
+try:
+    import pufferlib.sweep  # Optional; only needed for sweeps
+except Exception:
+    pufferlib.sweep = None
 import pufferlib.vector
 import pufferlib.pytorch
 try:
@@ -36,12 +39,41 @@ try:
 except ImportError:
     raise ImportError('Failed to import C/CUDA advantage kernel. If you have non-default PyTorch, try installing with --no-build-isolation')
 
-import rich
-import rich.traceback
-from rich.table import Table
-from rich.console import Console
-from rich_argparse import RichHelpFormatter
-rich.traceback.install(show_locals=False)
+try:
+    import rich
+    import rich.traceback
+    from rich.table import Table
+    from rich.console import Console
+    rich.traceback.install(show_locals=False)
+except Exception:  # Fallback to no-rich mode
+    rich = None
+    Table = object  # dummy
+    class Console:
+        def __init__(self):
+            pass
+        def print(self, *args, **kwargs):
+            pass
+        def capture(self):
+            class _C:
+                def __enter__(self_inner):
+                    class _S:
+                        def get(self_s):
+                            return ""
+                    self_inner._s = _S()
+                    return self_inner
+                def __exit__(self_inner, *a):
+                    pass
+                def get(self_inner):
+                    return self_inner._s.get()
+            return _C()
+    def _noop(*args, **kwargs):
+        return None
+    rich = type("_R", (), {"box": type("_B", (), {"ROUNDED": None}), "traceback": type("_T", (), {"install": _noop})})()
+
+try:
+    from rich_argparse import RichHelpFormatter
+except Exception:
+    from argparse import HelpFormatter as RichHelpFormatter
 
 import signal # Aggressively exit on ctrl+c
 signal.signal(signal.SIGINT, lambda sig, frame: os._exit(0))
@@ -539,6 +571,11 @@ class PuffeRL:
            if torch.distributed.get_rank() != 0:
                return
  
+        # Minimal fallback when rich is unavailable
+        if rich is None or Table is object:
+            print(f"PufferLib: env={config['env']} steps={int(agent_steps)} sps={int(sps)} epoch={self.epoch}")
+            return
+
         profile = self.profile
         console = Console()
         dashboard = Table(box=rich.box.ROUNDED, expand=True,

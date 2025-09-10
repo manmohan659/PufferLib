@@ -1,9 +1,4 @@
-from __future__ import annotations
-
 import functools
-import os
-from typing import Optional
-
 import numpy as np
 import gymnasium
 
@@ -11,250 +6,195 @@ import pufferlib
 import pufferlib.emulation
 
 
-try:
-    import pybullet as p
-    import pybullet_data
-except Exception as e:  # pragma: no cover - optional dependency
-    p = None
+def _try_import_pybullet():
+    try:
+        import pybullet as p
+        import pybullet_data  # noqa: F401
+        return p
+    except Exception as e:
+        raise ImportError(
+            "PyBullet is required for so_arm_bullet. Install with 'pip install pybullet' or conda-forge."
+        ) from e
 
 
 class SOArmBulletGym(gymnasium.Env):
-    """PyBullet-based SO-ARM env (URDF required).
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
 
-    Observation/Action layout matches the kinematics env for parity.
-    """
+    def __init__(self, urdf_path, render_mode=None, gui=False, max_steps=200, grasp_radius=0.03,
+                 obj_radius=0.02, obj_mass=0.2):
+        super().__init__()
+        self.p = _try_import_pybullet()
+        self.gui = gui
+        self.cid = self.p.connect(self.p.GUI if gui else self.p.DIRECT)
+        self.p.setAdditionalSearchPath("pybullet_data")
+        self.p.resetSimulation()
+        self.p.setGravity(0, 0, -9.81)
+        self.p.setTimeStep(1.0 / 240.0)
 
-    metadata = {"render_modes": ["rgb_array"], "render_fps": 60}
+        self.arm = self.p.loadURDF(urdf_path, useFixedBase=True)
 
-    def __init__(
-        self,
-        urdf_path: str,
-        render_mode: Optional[str] = None,
-        gui: bool = False,
-        max_steps: int = 200,
-        grasp_radius: float = 0.03,
-    ):
-        if p is None:
-            raise ImportError("pybullet is required for SOArmBulletGym. Install with `pip install pybullet`. ")
-
-        self.render_mode = render_mode
-        self.gui = bool(gui)
-        self.cid = p.connect(p.GUI if self.gui else p.DIRECT)
-        p.setAdditionalSearchPath(pybullet_data.getDataPath())
-        p.setGravity(0, 0, -9.81)
-
-        # Load plane for reference and the arm URDF
-        self.plane = p.loadURDF("plane.urdf")
-        if not os.path.isabs(urdf_path):
-            # If relative, allow using current working directory
-            urdf_path = os.path.abspath(urdf_path)
-        if not os.path.exists(urdf_path):
-            raise FileNotFoundError(f"URDF not found: {urdf_path}")
-        self.arm = p.loadURDF(urdf_path, useFixedBase=True)
-
-        # Discover revolute joints and try to find a tool/ee link
+        # Discover joints (revolute and prismatic) and EE link
         self.joints = []
-        self.joint_min, self.joint_max = [], []
-        self.tool_link = p.getNumJoints(self.arm) - 1
-        for j in range(p.getNumJoints(self.arm)):
-            info = p.getJointInfo(self.arm, j)
-            jtype = info[2]
-            if jtype == p.JOINT_REVOLUTE or jtype == p.JOINT_PRISMATIC:
+        self.joint_lower = []
+        self.joint_upper = []
+        num_j = self.p.getNumJoints(self.arm)
+        self.ee_link = -1
+        for j in range(num_j):
+            ji = self.p.getJointInfo(self.arm, j)
+            jtype = ji[2]
+            if jtype in (self.p.JOINT_REVOLUTE, self.p.JOINT_PRISMATIC):
                 self.joints.append(j)
-                lim_low, lim_high = info[8], info[9]
-                # If limits are invalid, fall back to wide default
-                if lim_low > lim_high:
-                    lim_low, lim_high = -np.pi, np.pi
-                self.joint_min.append(lim_low)
-                self.joint_max.append(lim_high)
-            name = info[12].decode("utf-8") if isinstance(info[12], (bytes, bytearray)) else str(info[12])
-            if any(k in name.lower() for k in ("tool", "tcp", "ee")):
-                self.tool_link = j
+                self.joint_lower.append(ji[8])
+                self.joint_upper.append(ji[9])
+            name = ji[12].decode("utf-8") if isinstance(ji[12], (bytes, bytearray)) else str(ji[12])
+            if any(k in name.lower() for k in ("tool", "tcp", "ee", "gripper")):
+                self.ee_link = j
+        if self.ee_link < 0:
+            self.ee_link = num_j - 1 if num_j > 0 else -1
 
-        self.joints = np.array(self.joints, dtype=int)
-        self.joint_min = np.array(self.joint_min, dtype=float)
-        self.joint_max = np.array(self.joint_max, dtype=float)
         self.dof = len(self.joints)
-
-        # Object and goal
-        self.obj_sid = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.02, 0.02, 0.02])
-        self.obj_vid = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.02, 0.02, 0.02], rgbaColor=[0.9, 0.3, 0.3, 1])
-        self.goal_sid = p.createCollisionShape(p.GEOM_SPHERE, radius=0.02)
-        self.goal_vid = p.createVisualShape(p.GEOM_SPHERE, radius=0.02, rgbaColor=[0.3, 0.9, 0.3, 1])
-
-        self.obj_id = None
-        self.goal_id = None
-        self.grasp_cid = None
         self.max_steps = int(max_steps)
         self.grasp_radius = float(grasp_radius)
+        self.obj_radius = float(obj_radius)
+        self.obj_mass = float(obj_mass)
 
-        # Observation/action spaces
-        obs_low = np.concatenate([
-            self.joint_min,
-            [-1, -1, 0],  # ee (coarse bounds)
-            [-1, -1, 0],  # obj
-            [-1, -1, 0],  # goal
-            [0.0],
-        ]).astype(np.float32)
-        obs_high = np.concatenate([
-            self.joint_max,
-            [1, 1, 1],
-            [1, 1, 1],
-            [1, 1, 1],
-            [1.0],
-        ]).astype(np.float32)
-        self.observation_space = gymnasium.spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
+        # Observation and action spaces
+        obs_dim = self.dof + 3 + 3 + 3 + 1
+        self.observation_space = gymnasium.spaces.Box(
+            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
+        )
         self.action_space = gymnasium.spaces.Box(
-            low=np.array([-0.05] * self.dof + [-1.0], dtype=np.float32),
-            high=np.array([0.05] * self.dof + [1.0], dtype=np.float32),
+            low=np.array([-0.05] * self.dof + [-1], dtype=np.float32),
+            high=np.array([0.05] * self.dof + [1], dtype=np.float32),
             dtype=np.float32,
         )
 
-        self.t = 0
+        # State
+        self.q = np.zeros(self.dof, dtype=np.float32)
+        self.ee = np.zeros(3, dtype=np.float32)
+        self.obj = np.zeros(3, dtype=np.float32)
+        self.goal = np.zeros(3, dtype=np.float32)
         self.grasped = False
-        self.q = np.zeros(self.dof, dtype=float)
-        self._reset_bodies()
+        self.grasp_cid = None
+        self.t = 0
 
-    # --- helpers ---
-    def _reset_bodies(self):
-        # Reset joints
-        for i, j in enumerate(self.joints):
-            p.resetJointState(self.arm, int(j), 0.0)
-            self.q[i] = 0.0
-        # Spawn object and goal at random positions
-        rng = np.random.default_rng()
-        obj_pos = rng.uniform([-0.2, -0.2, 0.05], [0.2, 0.2, 0.25])
-        goal_pos = rng.uniform([-0.2, -0.2, 0.05], [0.2, 0.2, 0.25])
+        # Object and goal placeholders
+        self.obj_id = None
+        self.goal_vis_id = None
+        self.render_mode = render_mode
+
+    def _spawn_world(self):
         if self.obj_id is not None:
-            p.removeBody(self.obj_id)
-        if self.goal_id is not None:
-            p.removeBody(self.goal_id)
-        self.obj_id = p.createMultiBody(baseMass=0.05, baseCollisionShapeIndex=self.obj_sid,
-                                        baseVisualShapeIndex=self.obj_vid, basePosition=obj_pos.tolist())
-        self.goal_id = p.createMultiBody(baseMass=0.0, baseCollisionShapeIndex=self.goal_sid,
-                                         baseVisualShapeIndex=self.goal_vid, basePosition=goal_pos.tolist())
-        if self.grasp_cid is not None:
-            p.removeConstraint(self.grasp_cid)
-            self.grasp_cid = None
+            self.p.removeBody(self.obj_id)
+            self.obj_id = None
+        if self.goal_vis_id is not None:
+            self.p.removeBody(self.goal_vis_id)
+            self.goal_vis_id = None
 
-    def _get_ee_pos(self) -> np.ndarray:
-        ls = p.getLinkState(self.arm, int(self.tool_link), computeForwardKinematics=True)
-        return np.array(ls[0], dtype=float)
+        # Small sphere as object (radius, mass configurable)
+        col = self.p.createCollisionShape(self.p.GEOM_SPHERE, radius=self.obj_radius)
+        vis = self.p.createVisualShape(self.p.GEOM_SPHERE, radius=self.obj_radius, rgbaColor=[1, 0, 0, 1])
+        self.obj_id = self.p.createMultiBody(baseMass=float(self.obj_mass), baseCollisionShapeIndex=col, baseVisualShapeIndex=vis,
+                                             basePosition=self.obj.tolist())
 
-    def _get_body_pos(self, bid) -> np.ndarray:
-        return np.array(p.getBasePositionAndOrientation(bid)[0], dtype=float)
+        # Sphere visual for goal
+        vis2 = self.p.createVisualShape(self.p.GEOM_SPHERE, radius=max(0.02, self.obj_radius*1.2), rgbaColor=[0, 1, 1, 0.7])
+        self.goal_vis_id = self.p.createMultiBody(baseMass=0, baseCollisionShapeIndex=-1, baseVisualShapeIndex=vis2,
+                                                  basePosition=self.goal.tolist())
+
+    def _ee_pos(self):
+        if self.ee_link >= 0:
+            ls = self.p.getLinkState(self.arm, self.ee_link, computeForwardKinematics=True)
+            return np.array(ls[0], dtype=np.float32)
+        else:
+            base = self.p.getBasePositionAndOrientation(self.arm)[0]
+            return np.array(base, dtype=np.float32)
 
     def _obs(self):
-        ee = self._get_ee_pos()
-        obj = self._get_body_pos(self.obj_id)
-        goal = self._get_body_pos(self.goal_id)
-        g = 1.0 if self.grasped else 0.0
-        return np.concatenate([self.q, ee, obj, goal, [g]]).astype(np.float32)
+        return np.concatenate([self.q, self.ee, self.obj, self.goal, [1.0 if self.grasped else 0.0]]).astype(np.float32)
 
-    # --- gym API ---
-    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
-        super().reset(seed=seed)
-        self.t = 0
+    def reset(self, seed=None):
+        if seed is not None:
+            np.random.seed(seed)
+        # Random small q and set joint states
+        self.q = np.random.uniform(-0.1, 0.1, size=self.dof).astype(np.float32)
+        for qi, j in zip(self.q, self.joints):
+            self.p.resetJointState(self.arm, j, float(qi))
+        self.ee = self._ee_pos()
+        # Workspace sampling
+        ws_min = np.array([-0.5, -0.5, 0.05], dtype=np.float32)
+        ws_max = np.array([0.5, 0.5, 0.6], dtype=np.float32)
+        self.obj = np.random.uniform(ws_min, ws_max).astype(np.float32)
+        self.goal = np.random.uniform(ws_min, ws_max).astype(np.float32)
         self.grasped = False
-        self._reset_bodies()
-        obs = self._obs()
-        info = {}
-        return obs, info
+        self.t = 0
+        self._spawn_world()
+        return self._obs(), {}
 
     def step(self, action):
-        a = np.asarray(action, dtype=float)
-        dq = a[: self.dof]
-        grip = float(a[self.dof])
+        a = np.asarray(action, dtype=np.float32)
+        dq, grip = a[: self.dof], float(a[self.dof])
+        target_q = np.clip(self.q + dq, self.joint_lower, self.joint_upper)
+        # position control
+        for j, tq in zip(self.joints, target_q):
+            self.p.setJointMotorControl2(self.arm, j, self.p.POSITION_CONTROL, targetPosition=float(tq), positionGain=0.4, force=50)
+        for _ in range(8):
+            self.p.stepSimulation()
+        self.q = target_q
+        self.ee = self._ee_pos()
 
-        # Position control to target q (current + dq), clamped to limits
-        q_target = np.clip(self.q + dq, self.joint_min, self.joint_max)
-        for i, j in enumerate(self.joints):
-            p.setJointMotorControl2(
-                bodyIndex=self.arm,
-                jointIndex=int(j),
-                controlMode=p.POSITION_CONTROL,
-                targetPosition=float(q_target[i]),
-                positionGain=0.5,
-                velocityGain=0.5,
-                force=5.0,
-            )
-        # Step simulation a few substeps for stability
-        for _ in range(4):
-            p.stepSimulation()
-        self.q = q_target.copy()
-
-        ee = self._get_ee_pos()
-        obj = self._get_body_pos(self.obj_id)
-        goal = self._get_body_pos(self.goal_id)
-
-        # Grasp logic via constraint
-        if grip > 0.0 and not self.grasped:
-            if np.linalg.norm(ee - obj) <= self.grasp_radius:
-                self.grasp_cid = p.createConstraint(
-                    parentBodyUniqueId=self.arm,
-                    parentLinkIndex=int(self.tool_link),
-                    childBodyUniqueId=self.obj_id,
-                    childLinkIndex=-1,
-                    jointType=p.JOINT_FIXED,
-                    jointAxis=[0, 0, 1],
-                    parentFramePosition=[0, 0, 0],
-                    childFramePosition=[0, 0, 0],
+        # grasp/open
+        if grip > 0 and not self.grasped:
+            if np.linalg.norm(self.ee - self.obj) <= (self.grasp_radius + self.obj_radius):
+                # Create fixed constraint
+                self.grasp_cid = self.p.createConstraint(
+                    self.arm,
+                    self.ee_link if self.ee_link >= 0 else -1,
+                    self.obj_id,
+                    -1,
+                    self.p.JOINT_FIXED,
+                    [0, 0, 0],
+                    [0, 0, 0],
+                    [0, 0, 0],
                 )
                 self.grasped = True
-        elif grip < 0.0 and self.grasped:
+        if grip < 0 and self.grasped:
             if self.grasp_cid is not None:
-                p.removeConstraint(self.grasp_cid)
-                self.grasp_cid = None
+                self.p.removeConstraint(self.grasp_cid)
+            self.grasp_cid = None
             self.grasped = False
 
-        # Reward and termination
-        dist = float(np.linalg.norm(obj - goal))
+        # Reward
+        dist = float(np.linalg.norm(self.obj - self.goal))
         reached = dist <= 0.03
-        reward = -dist + (1.0 if reached else 0.0) - 0.001 * float(np.linalg.norm(dq))
-
+        r = -dist + (1.0 if reached else 0.0) - 0.001 * float(np.linalg.norm(dq))
         self.t += 1
-        terminated = bool(reached)
-        truncated = bool(self.t >= self.max_steps)
-        obs = self._obs()
-        info = {"dist_to_goal": dist, "reached": bool(reached), "grasped": bool(self.grasped)}
-        return obs, reward, terminated, truncated, info
+        term = bool(reached)
+        trunc = bool(self.t >= self.max_steps)
+        return self._obs(), r, term, trunc, {
+            "dist_to_goal": dist,
+            "reached": reached,
+            "grasped": bool(self.grasped),
+        }
 
-    def render(self):  # pragma: no cover - optional
-        if self.render_mode != "rgb_array":
-            return None
-        # Use TinyRenderer camera; for brevity return None here
-        return None
+    def render(self):
+        # GUI handled by PyBullet viewer
+        pass
 
-    def close(self):  # pragma: no cover - optional
+    def close(self):
         try:
-            if p and self.cid is not None:
-                p.disconnect(self.cid)
+            self.p.disconnect(self.cid)
         except Exception:
             pass
 
 
-def single_env_creator(
-    urdf_path: str,
-    capture_video: bool,
-    gamma: float,
-    run_name: str | None = None,
-    idx: int | None = None,
-    obs_norm: bool = True,
-    pufferl: bool = True,
-    render_mode: str = "rgb_array",
-    gui: bool = False,
-    buf=None,
-    seed: int = 0,
-):
+def single_env_creator(urdf_path, capture_video, gamma, run_name=None, idx=None, obs_norm=True, pufferl=True, render_mode='rgb_array', gui=False, buf=None, seed=0):
     env = SOArmBulletGym(urdf_path=urdf_path, render_mode=render_mode, gui=gui)
-    if capture_video and (idx == 0) and run_name is not None:
-        env = gymnasium.wrappers.RecordVideo(env, f"videos/{run_name}")
     env = pufferlib.ClipAction(env)
     env = pufferlib.EpisodeStats(env)
     if obs_norm:
         env = gymnasium.wrappers.NormalizeObservation(env)
-        # Ensure dtype stays float32 for emulation checks
-        env = gymnasium.wrappers.TransformObservation(env, lambda o: np.clip(o, -10, 10).astype(np.float32))
+        env = gymnasium.wrappers.TransformObservation(env, lambda x: np.clip(x, -10, 10), env.observation_space)
     env = gymnasium.wrappers.NormalizeReward(env, gamma=gamma)
     env = gymnasium.wrappers.TransformReward(env, lambda r: float(np.clip(r, -10, 10)))
     if pufferl:
@@ -262,12 +202,5 @@ def single_env_creator(
     return env
 
 
-def env_creator(urdf_path: str, gamma: float = 0.99):
-    """Return a partial that creates a wrapped Gym env compatible with pufferl."""
-    return functools.partial(
-        single_env_creator,
-        urdf_path=urdf_path,
-        capture_video=False,
-        gamma=gamma,
-        pufferl=True,
-    )
+def env_creator(urdf_path, gamma=0.99):
+    return functools.partial(single_env_creator, urdf_path=urdf_path, capture_video=False, gamma=gamma, pufferl=True)
